@@ -1,0 +1,8 @@
+[
+    {
+        "role": "<|User|>",
+        "content": "<image_placeholder>\n{question}",
+        "images": ["data:image,{image}"]
+    },
+    {"role": "<|Assistant|>", "content": ""}
+]

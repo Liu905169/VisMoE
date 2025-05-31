@@ -1,0 +1,15 @@
+{
+  "role": "user",
+  "content": [
+    {
+      "type": "image_url",
+      "image_url": {
+        "url": ""
+      }
+    },
+    {
+      "type": "text",
+      "text": ""
+    }
+  ]
+}
