@@ -20,55 +20,18 @@ from utils.janus.utils.io import load_pil_images
 import torch
 
 from classify import TimeSeriesClassifier
+from einops import rearrange
 
 import numpy as np
 
 classifier=TimeSeriesClassifier(window_size=24,periodic_threshold=0.48,half_periodic_threshold=1.2)
 
 
-# vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained("./janusmodel", local_files_only=True,trust_remote_code=True)
-# tokenizer = vl_chat_processor.tokenizer
-# vl_gpt: MultiModalityCausalLM = AutoModelForCausalLM.from_pretrained(
-#     "./janusmodel", local_files_only=True,trust_remote_code=True
-# ).to(torch.bfloat16).cuda().eval()
-
-# def get_question(text,image_url=None):
-#     q={
-#           "content": [
-#               {
-#                   "text": text,
-#                   "type": "text"
-#               }
-#           ],
-#           "role": "user"
-#       } if image_url==None else {
-#           "content": [
-#               {
-#                   "image_url": {
-#                       "url": image_url
-#                   },
-#                   "type": "image_url"
-#               },
-#               {
-#                   "text": text,
-#                   "type": "text"
-#               }
-#           ],
-#           "role": "user"
-#       }
-#     return q
-
-# def get_response(ans,role='assistant'):
-#     r={
-#           "content": [
-#               {
-#                   "text": ans,
-#                   "type": "text"
-#               }
-#           ],
-#           "role": role
-#       }
-#     return r
+vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained("./janusmodel", local_files_only=True,trust_remote_code=True)
+tokenizer = vl_chat_processor.tokenizer
+vl_gpt: MultiModalityCausalLM = AutoModelForCausalLM.from_pretrained(
+    "./janusmodel", local_files_only=True,trust_remote_code=True
+).to(torch.bfloat16).cuda().eval()
 
 def tstoUrl(data):
     x = range(len(data))
@@ -122,25 +85,6 @@ def get_index(path):
             index=int(match.group(1))
     return index
 
-# @retry(stop_max_attempt_number=3, wait_fixed=1000)#,exceptions=APIStatusError
-# def tryReadPic(message,embbeding=True):
-#     response = client.chat.completions.create(
-#         model="glm-4v-flash",
-#         messages=message
-#     )
-#     text = response.choices[0].message.content
-#     reply=get_response(response.choices[0].message.content,response.choices[0].message.role)
-        
-#     if embbeding:
-#         response = client.embeddings.create(
-#             model="embedding-3",
-#             input=json.dumps(text),
-#         )
-#         out=response.data[0].embedding
-#     else:
-#         out=None
-#     return text,out,reply
-
 def tryReadPic(message,embbeding=True):
     # print(message)
     pil_images = load_pil_images(message)
@@ -190,7 +134,21 @@ def save_fig(data,file,title=''):
     img.savefig(file, format='png')
     plt.clf()
     
-    
+def get_embedding(context,ctype,model):
+    if ctype=='image':
+        bs, n = context.shape[0:2]
+        images = rearrange(context, "b n c h w -> (b n) c h w")
+        # [b x n, T2, D]
+        images_embeds = model.aligner(model.vision_model(images))
+
+        # [b x n, T2, D] -> [b, n x T2, D]
+        images_embeds = rearrange(images_embeds, "(b n) t d -> b (n t) d", b=bs, n=n)
+        return images_embeds
+    else:
+        context[context < 0] = 0  # ignore the image embeddings
+        inputs_embeds = model.language_model.get_input_embeddings()(context)
+        return inputs_embeds
+
 parser = argparse.ArgumentParser(description='Time-LLM')
 
 # data loader
@@ -241,49 +199,15 @@ print('test:',len(test_data))
 
 savepath=args.savepath
 
-dataset_description='ETTm1数据集记录了从2016年7月到2018年7月的变压器数据，每一小时记录一次。'
-abnoromal_claim='注意数据集中可能存在异常值，你需要忽略异常值。'
-trend_keywords='上升，下降，保持平稳，先上升后下降，先下降后上升，平稳上升，平稳下降,震荡'
-types=[
-    '周期型：图像中的数据存在明显的周期性波动',
-    '弱周期型：图像中的数据周期性波动存在但不明显',
-    '趋势型：图像具有明显的趋势，不存在明显的波动',
-    '其他：不明显属于以上几种类型的'
-]
-type_description='你是一个时序图像分析专家，请根据以下标准对输入的时序图像进行分类：\n\
-    【分类标准】\n\
-    1. 周期型（Periodic）：\n\
-    - 存在至少3个重复出现的相似波形/模式\n\
-    - 相邻波峰/波谷间隔时间差不超过±15%\n\
-    - 振幅波动范围相对稳定（最大波动不超过平均振幅的30%）\n\
-    2. 趋势型（Trend）：\n\
-    - 整体呈现单调递增/递减走向（允许短期波动但幅度<整体趋势的20%）\n\
-    - 线性趋势：相关系数|r| > 0.7\n\
-    - 非线性趋势：二阶导数符号保持统一\n\
-    3. 其他（Irregular）：\n\
-    - 同时包含周期和趋势成分（如趋势性上涨的波动）\n\
-    - 无主导模式（随机波动占主导）\n\
-    - 存在突变点或断点（单点变化幅度>整体范围的50%）\n\
-    【分析维度】\n\
-    请按以下顺序进行判断：\n\
-    1. 波形重复性检测 → 2. 整体斜率评估 → 3. 波动成分分解\n\
-    【输出格式】\n\
-    结论：<周期型/趋势型/其他>\n\
-    理由：\n\
-    - 关键特征1：<特征描述>\n\
-    - 关键特征2：<特征描述>\n\
-    - 排除条件：<不符合其他类型的理由>'
+types=['This sequence exhibits stable periodic fluctuations with identifiable repeatingpatterns.',
+       'This sequence shows partial periodicity, but the cycle length or amplitude varies to some extent.',
+       'This sequence displays a clear long-term upward/downward trend.',
+       'This sequence lacks clear periodicity or trend, exhibiting random or abrupt variations.']
 type_dict={
     "periodic":[1,0,0,0],
     "half_periodic":[0,1,0,0],
     "trend":[0,0,1,0],
     "irregular":[0,0,0,1],
-}
-type_dict_e={
-    "周期型":[1,0,0,0],
-    "弱周期型":[0,1,0,0],
-    "趋势型":[0,0,1,0],
-    "其他":[0,0,0,1],
 }
 
 def translator(data,trans:dict):
@@ -311,20 +235,11 @@ datamap={'val':vali_data,'test':test_data}
 # print(len(train_data))
 for name,dataset in datamap.items():
     counts=np.array([0,0,0,0])
-    texts={
-        # 'l_type':[]
-        # 'l_trend':[],
-        # 'l_traits':[],
-        # 's_trend':[],
-    }
+    # texts={
+    #     # 'l_type':[]
+    # }
     outs={
         'l_type':[],
-        # 'l_trend':[],
-        # 'l_traits':[],
-        # 'l_periods':[],
-        # 's_trend':[],
-        # 'x':[],
-        # 'y':[],
     }
     index=get_index(os.path.join(folder_path,name))
     if index!=0:
@@ -333,72 +248,36 @@ for name,dataset in datamap.items():
         print(index)
     
     try:
-        j=0
         for i in tqdm(range(index,len(dataset))):
-        # for i in tqdm(range(index,100)):
-        # if name=='train' and i<4200: continue
-            long=[]#long_template.copy()
-            # short=[]#short_template.copy()
-            
-            # x,y,lx,sx,ex,sy,ey,lsx=dataset[i]
+            long=[]
             x,y,_,_=dataset[i]
-            # y=y[96:,:]
-            # print(x.shape)
-            res,score=classifier.classify(x[-96:,0])
-            # save_fig(np.concatenate((x,y)),os.path.join(os.path.join(folder_path,name),f'pics/{i}.png'),title=f'{res}_{score:.5f}')
-            out=type_dict[res]
-            counts+=np.array(out)
             
-            # texts['l_type'].append(res)
-            outs['l_type'].append(out)
+            ps=[]
+            for t in types:
+                conversation=[get_question(t,tstoUrl(x[-args.label_len:,0]))]
+                pil_images = load_pil_images(conversation)
+                
+                prepare_inputs = vl_chat_processor(
+                conversations=conversation,
+                images=pil_images,
+                force_batchify=True
+                ).to(vl_gpt.device)
+
+                im=get_embedding(context=prepare_inputs['pixel_values'],ctype='image',model=vl_gpt)
+                tx=get_embedding(context=prepare_inputs['input_ids'],ctype='text',model=vl_gpt)
+                likely=torch.mean(torch.einsum('btd,bld->btl',im,tx))
+                ps.append(likely.item())
+                
+            ps=np.array(ps)
+            output = np.zeros_like(ps, dtype=int)
+            output[ps == np.max(ps)] = 1
+            
+            counts+=np.array(output)
+            
+            outs['l_type'].append(output)
             
             
             long_base = tstoUrl(x[-args.label_len:])
-            # # long.append(get_question(image_url=long_base,
-            # #                          text=f"{dataset_description}数据的起始时间为{sx}，终止时间为{ex},根据这张图片，请你宏观地描述这张图片的最大值，最小值以及异常点"))
-            # # text,out,reply =tryReadPic(long,embbeding=True) 
-            # # # texts['l_trend'].append(text)
-            # # # outs['l_trend'].append(out)
-            # # long.append(reply)
-        
-            # long.append(get_question(image_url=long_base,
-            #                          text=f"{dataset_description},该图片包含了其中一段时间的数据折线图,请你根据图片直接给出图片中的时序数据所属类别，不需要理由，数据的类别包括以下四类：{types[0]};{types[1]};{types[2]};{types[3]}；"))
-            # text,_,reply =tryReadPic(long,embbeding=True) 
-            # out=translator(text,type_dict_e)
-            # print(reply)
-            # counts+=np.array(out)
-            # texts['l_type'].append(text)
-            # outs['l_type'].append(out)
-            # long.append(reply)
-            
-            # long_base = tstoUrl(lx)
-            # long.append(get_question(text=f"{dataset_description}数据的起始时间为{sx}，终止时间为{sx}，根据这张图片，将该图片分割为3-4个长度相近的区间，给出区间数以及这些区间的开始和结束节点并陈述为何这样划分。"))
-            # text,out,reply =tryReadPic(long,embbeding=False) 
-            # long.append(reply)
-        
-            # long.append(get_question(text=f"{dataset_description}数据的起始时间为{sx}，终止时间为{sx},根据你的划分结果，请整理你的回答，依次详细描述每个区间的趋势特征，你的输出结果应当符合如下格式‘区间1：开始节点，结束节点，趋势特征；区间2：开始节点，结束节点，趋势特征；…区间n：开始节点，结束节点，趋势特征；’"))
-            # text,out,reply =tryReadPic(long,embbeding=True) 
-            # texts['l_periods'].append(text)
-            # outs['l_periods'].append(out)
-            # long.append(reply)
-        
-            # short_base = tstoUrl(x)
-            # short.append(get_question(text=f"{dataset_description}这是该序列的最近几段时间的趋势图，根据这张图片，请你尽量详细描述这张图片的整体趋势，你可以选择用以下关键词以及关键词组合来描述：{trend_keywords}",
-            #                           image_url=short_base))
-            # text,out,reply =tryReadPic(short,embbeding=True) 
-            # texts['s_trend'].append(text)
-            # outs['s_trend'].append(out)
-            # short.append(reply)
-            
-            #
-            
-            # outs['x'].append(x[:,0])
-            # outs['y'].append(y[:,0])
-            j+=1
-            if j>=50000:
-                j=0
-                save_outs(outs,os.path.join(folder_path,name),i)
-                outs['l_type'].clear()
         print(counts)
     except Exception as e:
         # save_ans(texts,os.path.join(folder_path,name),i)
